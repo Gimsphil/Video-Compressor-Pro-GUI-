@@ -1,0 +1,20 @@
+# Video Compressor Pro - Python 의존성
+# ======================================
+# 모두 Python 표준 라이브러리이며 pip 설치 불필요
+#
+# 사용 라이브러리:
+#   tkinter          - GUI (Python 내장)
+#   subprocess       - ffmpeg 프로세스 실행 (내장)
+#   threading        - 백그라운드 압축 (내장)
+#   queue            - 스레드 간 통신 (내장)
+#   urllib.request   - ffmpeg 다운로드 (내장)
+#   zipfile          - ffmpeg ZIP 해제 (내장)
+#   pathlib          - 경로 처리 (내장)
+#   json             - 환경 설정 저장 (내장)
+#   shutil           - 파일 관리 (내장)
+#
+# 외부 도구 (자동 다운로드):
+#   ffmpeg >= 4.0    - 영상 인코딩 엔진 (setup.bat 실행 시 자동 설치)
+#
+# EXE 빌드 시에만 필요:
+pyinstaller>=5.0
