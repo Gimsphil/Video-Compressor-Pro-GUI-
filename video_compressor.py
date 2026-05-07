@@ -109,13 +109,47 @@ def fmt_dur(s: float) -> str:
     return str(timedelta(seconds=int(s)))
 
 
+def estimate_compression(codec: str, crf: int, src_size: int) -> tuple:
+    """
+    코덱와 CRF 설정에 기반한 예상 압축률 계산.
+    소스 코덱이 H.264이면 H.265 전환으로 많이 줄어듦,
+    이미 H.265면 소폭 줄어듦.
+    Returns: (estimated_size_bytes, ratio_float)
+    """
+    c = codec.lower()
+    if any(x in c for x in ("h264", "avc", "264")):
+        base = 0.42   # H.264 → H.265: 약 42% 감소
+    elif any(x in c for x in ("hevc", "h265", "265")):
+        base = 0.15   # 이미 H.265: 약 15% 추가 감소
+    elif any(x in c for x in ("mpeg4", "xvid", "divx", "mpeg-4")):
+        base = 0.50   # 구형식 코덱: 약 50% 감소
+    elif any(x in c for x in ("mjpeg", "prores", "dnxhd")):
+        base = 0.75   # 로슬리스 코덱: 약 75% 감소
+    elif any(x in c for x in ("wmv", "vc1")):
+        base = 0.38
+    else:
+        base = 0.35   # 기타 (미상: H.264 유사)
+
+    # CRF 28 기준, 1단위당 약 1.5% 추가 조정
+    crf_adj = (crf - 28) * 0.015
+    ratio = max(0.05, min(0.90, base + crf_adj))
+
+    est_sz = int(src_size * (1 - ratio))
+    return est_sz, ratio
+
+
 def get_video_info(ffmpeg: str, path: str) -> dict:
+    try:
+        sz = os.path.getsize(path)
+    except OSError:
+        sz = 0
+
     info = {
         "duration": 0.0,
         "duration_str": "—",
         "resolution": "—",
         "codec": "—",
-        "size": os.path.getsize(path)
+        "size": sz
     }
     try:
         # ffprobe 가 있으면 더 좋지만, ffmpeg -i 로 최대한 파싱
@@ -185,19 +219,39 @@ class CompressWorker:
         done_size_in  = 0
         done_size_out = 0
 
-        for idx, src in enumerate(self.files):
+        # files 리스트는 dict 형태: {path, name, display_name, rel_path, base_folder, ...}
+        for idx, fobj in enumerate(self.files):
             if self._cancel.is_set():
                 self.q.put(("cancelled", None))
                 return
 
+            src = fobj["path"]
             src_path = Path(src)
-            self.q.put(("file_start", (idx, total, src_path.name)))
+            rel_path  = fobj.get("rel_path", "")   # 하위 폴더 상대 경로 (없으면 "")
+            display_name = fobj.get("display_name", src_path.name)
+            self.q.put(("file_start", (idx, total, display_name)))
 
-            # ── 출력 경로 결정 ──
+            # ── 출력 경로 결정 (폴더 구조 보존) ──
             if self.settings["out_mode"] == "comp":
-                out_dir = src_path.parent / "Comp"
+                # 하위폴더 포함 모드: rel_path의 부모 경로를 Comp 안에 재현
+                if rel_path:
+                    rel_parent = Path(rel_path).parent
+                    out_dir = src_path.parent
+                    # rel_path 기준으로 루트 폴더를 역산하여 Comp 위치 결정
+                    base_folder = fobj.get("base_folder", "")
+                    if base_folder:
+                        out_dir = Path(base_folder) / "Comp" / rel_parent
+                    else:
+                        out_dir = src_path.parent / "Comp"
+                else:
+                    out_dir = src_path.parent / "Comp"
             else:
-                out_dir = Path(self.settings["out_dir"])
+                base_out = Path(self.settings["out_dir"])
+                if rel_path:
+                    rel_parent = Path(rel_path).parent
+                    out_dir = base_out / rel_parent
+                else:
+                    out_dir = base_out
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / (src_path.stem + "_comp.mp4")
 
@@ -288,13 +342,14 @@ class CompressWorker:
                 done_size_out += out_sz
 
                 self.q.put(("file_done", {
-                    "name":    src_path.name,
-                    "in_sz":   in_sz,
-                    "out_sz":  out_sz,
-                    "ratio":   ratio,
-                    "elapsed": elapsed,
-                    "out_path": str(out_path),
-                    "idx":     idx,
+                    "name":       src_path.name,
+                    "display_name": display_name,
+                    "in_sz":      in_sz,
+                    "out_sz":     out_sz,
+                    "ratio":      ratio,
+                    "elapsed":    elapsed,
+                    "out_path":   str(out_path),
+                    "idx":        idx,
                 }))
 
             except Exception as e:
@@ -321,6 +376,10 @@ class VideoCompressorApp:
         self.wthread = None
         self.q       = queue.Queue()
         self._running = False
+        
+        # UI 변수 초기화
+        self.recursive = tk.BooleanVar(value=False)
+        self.del_orig = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._set_icon()
@@ -348,7 +407,7 @@ class VideoCompressorApp:
         }
 
         # 파일 열기
-        tk.Button(tbar, text="📄 파일 열기", **btn_style,
+        tk.Button(tbar, text="📄 파일 추가 (복수)", **btn_style,
                   command=self._add_files).pack(side=tk.LEFT, fill=tk.Y)
         
         # 폴더 열기
@@ -426,22 +485,27 @@ class VideoCompressorApp:
 
         self._build_toolbar(r)
         
+        # ── 하단 영역 먼저 pack하여 창 크기에 밀려 사라지지 않게 함 ──
+        btm_container = tk.Frame(r, bg=CLR_BG)
+        btm_container.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self._build_menu()
+
+        btm = tk.Frame(btm_container, bg=CLR_BG)
+        btm.pack(fill=tk.BOTH, padx=8, pady=4)
+        
+        self._build_progress(btm)
+        self._build_log(btm)
+        self._build_buttons(btm_container)
+
         # ── 메인 영역 (좌: 설정, 우: 파일 목록) ──
         main = tk.Frame(r, bg=CLR_BG)
-        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 0))
+        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(2, 0))
         main.columnconfigure(1, weight=1)
         main.rowconfigure(0, weight=1)
 
         self._build_settings(main)
         self._build_filelist(main)
-
-        # ── 하단 (진행 + 로그 + 버튼) ──
-        btm = tk.Frame(r, bg=CLR_BG)
-        btm.pack(fill=tk.BOTH, padx=8, pady=4)
-        self._build_menu()
-        self._build_progress(btm)
-        self._build_log(btm)
-        self._build_buttons(r)
 
     def _label(self, parent, text, **kw):
         return tk.Label(parent, text=text, bg=kw.pop("bg", CLR_PANEL),
@@ -533,9 +597,12 @@ class VideoCompressorApp:
         # ─ 기타 옵션 ─
         sec6 = self._section(left, "⚙️ 기타 옵션")
         sec6.pack(fill=tk.X, padx=8, pady=4)
-        self.recursive = tk.BooleanVar(value=False)
         tk.Checkbutton(sec6, text="폴더 추가 시 하위 폴더 포함",
                        variable=self.recursive,
+                       bg=CLR_PANEL, fg=CLR_TEXT, selectcolor=CLR_BTN,
+                       activebackground=CLR_PANEL).pack(anchor=tk.W)
+        tk.Checkbutton(sec6, text="압축 후 원본 삭제",
+                       variable=self.del_orig,
                        bg=CLR_PANEL, fg=CLR_TEXT, selectcolor=CLR_BTN,
                        activebackground=CLR_PANEL).pack(anchor=tk.W)
 
@@ -569,9 +636,9 @@ class VideoCompressorApp:
                                   font=("Malgun Gothic", 9))
         self.count_lbl.pack(side=tk.LEFT, pady=6)
 
-        cols = ("name", "size", "duration", "resolution", "status")
-        col_hdr = ("파일명", "크기", "길이", "해상도", "상태")
-        col_w = (300, 80, 70, 100, 130)
+        cols    = ("name", "size", "estimated", "duration", "resolution", "status")
+        col_hdr = ("파일명", "원본 크기", "예상 압축", "길이", "해상도", "상태")
+        col_w   = (260, 75, 130, 65, 90, 110)
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -609,56 +676,7 @@ class VideoCompressorApp:
         self.tree.bind("<Button-3>", self._show_ctx)
 
 
-    def _build_filelist(self, parent):
-        right = tk.Frame(parent, bg=CLR_PANEL)
-        right.grid(row=0, column=1, sticky="nsew")
 
-        hdr = tk.Frame(right, bg=CLR_HEADER)
-        hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="  📋 압축 대기열", bg=CLR_HEADER, fg=CLR_TEXT,
-                 font=("Malgun Gothic", 10, "bold")).pack(side=tk.LEFT, pady=6)
-        self.count_lbl = tk.Label(hdr, text="(0개)", bg=CLR_HEADER, fg=CLR_SUBTEXT,
-                                  font=("Malgun Gothic", 9))
-        self.count_lbl.pack(side=tk.LEFT, pady=6)
-
-        cols = ("name", "size", "duration", "resolution", "status")
-        col_hdr = ("파일명", "크기", "길이", "해상도", "상태")
-        col_w = (300, 80, 70, 100, 130)
-
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Treeview",
-                        background=CLR_PANEL, foreground=CLR_TEXT,
-                        fieldbackground=CLR_PANEL, rowheight=24,
-                        font=("Malgun Gothic", 9))
-        style.configure("Treeview.Heading",
-                        background=CLR_BTN, foreground=CLR_TEXT,
-                        relief="flat", font=("Malgun Gothic", 9, "bold"))
-        style.map("Treeview", background=[("selected", CLR_ACCENT)])
-
-        frame_tree = tk.Frame(right, bg=CLR_PANEL)
-        frame_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-
-        self.tree = ttk.Treeview(frame_tree, columns=cols, show="headings", selectmode="extended")
-        for c, h, w in zip(cols, col_hdr, col_w):
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, minwidth=50)
-        self.tree.tag_configure("done",    foreground=CLR_ACCENT2)
-        self.tree.tag_configure("error",   foreground=CLR_WARNING)
-        self.tree.tag_configure("running", foreground=CLR_ACCENT)
-        self.tree.tag_configure("wait",    foreground=CLR_TEXT)
-
-        vsb = ttk.Scrollbar(frame_tree, orient=tk.VERTICAL,   command=self.tree.yview)
-        hsb = ttk.Scrollbar(frame_tree, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        vsb.pack(side=tk.RIGHT,  fill=tk.Y)
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
-        self.tree.pack(fill=tk.BOTH, expand=True)
-
-        self.ctx_menu = tk.Menu(self.root, tearoff=0)
-        self.ctx_menu.add_command(label="선택 항목 삭제", command=self._remove_selected)
-        self.ctx_menu.add_command(label="출력 폴더 열기", command=self._open_out_dir)
-        self.tree.bind("<Button-3>", self._show_ctx)
 
     # ── 진행률 ──────────────────────────────────────────────────────
 
@@ -771,6 +789,13 @@ class VideoCompressorApp:
             command=self._stop_compress)
         self.btn_stop.pack(side=tk.LEFT, padx=6, pady=4)
 
+        self.btn_cancel = tk.Button(
+            bf, text="✖  취소", bg=CLR_BTN, fg=CLR_WARNING,
+            font=("Malgun Gothic", 11, "bold"), relief=tk.FLAT,
+            padx=20, cursor="hand2",
+            command=self._clear_list)
+        self.btn_cancel.pack(side=tk.LEFT, padx=6, pady=4)
+
         tk.Button(bf, text="🔍 ffmpeg 확인",
                   bg=CLR_BTN, fg=CLR_TEXT, relief=tk.FLAT,
                   padx=12, cursor="hand2", command=self._check_ffmpeg_manual).pack(
@@ -789,6 +814,19 @@ class VideoCompressorApp:
 
     def _on_crf(self, val):
         self.crf_lbl.config(text=str(int(float(val))))
+        self._update_estimates()
+
+    def _update_estimates(self):
+        """CRF 변경 시 대기 중인 모든 파일의 예상 압축률 업데이트"""
+        crf = self.crf_var.get()
+        for f in self.files:
+            if f.get("status") == "wait":
+                est_sz, ratio = estimate_compression(f.get("codec", ""), crf, f["size"])
+                est_txt = f"~{fmt_size(est_sz)}  (-{ratio*100:.0f}%)"
+                self.tree.item(f["iid"], values=(
+                    f["display_name"], fmt_size(f["size"]), est_txt,
+                    f.get("duration_str", "—"), f.get("resolution", "—"), "⏳ 대기"
+                ))
 
     def _on_out_mode(self):
         mode = self.out_mode.get()
@@ -801,13 +839,56 @@ class VideoCompressorApp:
         if d:
             self.out_dir_var.set(d)
 
+    def _check_clear_before_add(self) -> bool:
+        """
+        작업이 끝난(완료/중지/취소/에러) 파일이 있으면 새 작업 시작 전 목록을 자동으로 비운다.
+        - True : 진행
+        - False: 취소
+        """
+        if not self.files:
+            return True
+
+        # 리스트에 하나라도 대기 상태만 있으면 그냥 추가 (작업 중복 베형)
+        statuses = {f.get("status", "wait") for f in self.files}
+        only_waiting = statuses <= {"wait"}
+        if only_waiting and not self._running:
+            return True
+
+        # 대기 상태가 아닌 항목(완료, 에러 등)이 포함되어 있다면 목록을 초기화
+        self.tree.delete(*self.tree.get_children())
+        self.files.clear()
+        self._refresh_count()
+        self._log("이전 작업이 완료/중지되어 목록을 비우고 새 작업으로 시작합니다.", "info")
+        
+        # 진행바 및 UI 초기화
+        self.pb_total["value"] = 0
+        self.lbl_total_pct.config(text="0%")
+        self.pb_file["value"] = 0
+        self.lbl_file_pct.config(text="0%")
+        self.lbl_eta.config(text="ETA —")
+        self.lbl_elapsed.config(text="경과 —")
+        self.lbl_cur_file.config(text="대기 중...")
+        self.status_lbl.config(text="대기 중", fg=CLR_SUBTEXT)
+        self.lbl_ratio.config(text="압축률 —")
+
+        return True
+
     def _add_files(self):
+        if self._running:
+            messagebox.showwarning("경고", "압축 중에는 파일을 추가할 수 없습니다.")
+            return
+        if not self._check_clear_before_add():
+            return
+
         paths = filedialog.askopenfilenames(
             title="영상 파일 선택",
             filetypes=[("영상 파일",
                         " ".join(f"*{e}" for e in sorted(VIDEO_EXTENSIONS))),
                        ("모든 파일", "*.*")]
         )
+        if not paths:
+            return
+            
         added = 0
         for p in paths:
             if self._enqueue_file(p):
@@ -817,48 +898,86 @@ class VideoCompressorApp:
             self._refresh_count()
 
     def _add_folder(self):
+        if self._running:
+            messagebox.showwarning("경고", "압축 중에는 폴더를 추가할 수 없습니다.")
+            return
+        if not self._check_clear_before_add():
+            return
+
         folder = filedialog.askdirectory(title="폴더 선택")
         if not folder:
             return
-        videos = collect_videos(folder, recursive=self.recursive.get())
+
+        # ── 하위 폴더 포함 여부 다이얼로그 ──
+        include_sub = messagebox.askyesno(
+            "하위 폴더 포함",
+            "하위 폴더의 영상 파일도 포함하시겠습니까?\n\n"
+            "[예]  하위 폴더 포함 (폴더 구조 보존)\n"
+            "[아니오]  현재 폴더만"
+        )
+
+        videos = collect_videos(folder, recursive=include_sub)
         added = 0
+        base = Path(folder)
         for v in videos:
-            if self._enqueue_file(v):
+            # 상대 경로 계산 (하위 폴더 포함 시)
+            try:
+                rel = Path(v).relative_to(base)
+            except ValueError:
+                rel = Path(Path(v).name)
+            rel_str = str(rel) if include_sub else ""
+            if self._enqueue_file(v, base_folder=str(base), rel_path=rel_str):
                 added += 1
         if added:
-            self._log(f"폴더에서 {added}개 영상 추가됨: {folder}", "info")
+            mode_txt = "(하위 폴더 포함, 구조 보존)" if include_sub else ""
+            self._log(f"폴더에서 {added}개 영상 추가됨: {folder} {mode_txt}", "info")
         else:
             self._log("추가할 영상이 없습니다.", "dim")
         self._refresh_count()
 
-    def _enqueue_file(self, path: str) -> bool:
+    def _enqueue_file(self, path: str, base_folder: str = "", rel_path: str = "") -> bool:
         # 중복 제거
         for f in self.files:
             if f["path"] == path:
                 return False
         
-        sz   = os.path.getsize(path)
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            return False
+
         name = os.path.basename(path)
-        
-        # 기본 정보 미리 채우기 (ffmpeg 있으면 상세정보 가져오기)
-        d_str, res = "—", "—"
+        display_name = rel_path if rel_path else name
+
+        # 기본 정보 미리 채우기
+        d_str, res, codec = "—", "—", ""
         if self.ffmpeg:
-            info = get_video_info(self.ffmpeg, path)
+            info  = get_video_info(self.ffmpeg, path)
             d_str = info["duration_str"]
             res   = info["resolution"]
-        
-        iid  = self.tree.insert("", tk.END,
-                                values=(name, fmt_size(sz), d_str, res, "⏳ 대기"),
-                                tags=("wait",))
-        
+            codec = info.get("codec", "")
+
+        # 예상 압축률 계산
+        crf = self.crf_var.get()
+        est_sz, ratio = estimate_compression(codec, crf, sz)
+        est_txt = f"~{fmt_size(est_sz)}  (-{ratio*100:.0f}%)"
+
+        iid = self.tree.insert("", tk.END,
+                               values=(display_name, fmt_size(sz), est_txt, d_str, res, "⏳ 대기"),
+                               tags=("wait",))
+
         self.files.append({
-            "path": path, 
-            "name": name, 
-            "size": sz, 
-            "iid": iid, 
-            "status": "wait",
+            "path":         path,
+            "name":         name,
+            "display_name": display_name,
+            "rel_path":     rel_path,
+            "base_folder":  base_folder,
+            "size":         sz,
+            "codec":        codec,
+            "iid":          iid,
+            "status":       "wait",
             "duration_str": d_str,
-            "resolution": res
+            "resolution":   res,
         })
         return True
 
@@ -874,9 +993,10 @@ class VideoCompressorApp:
     def _remove_selected(self):
         if self._running:
             return
-        for iid in self.tree.selection():
+        selected = list(self.tree.selection())
+        for iid in selected:
             self.tree.delete(iid)
-            self.files = [f for f in self.files if f["iid"] != iid]
+        self.files = [f for f in self.files if f["iid"] not in selected]
         self._refresh_count()
 
     def _open_out_dir(self):
@@ -927,10 +1047,14 @@ class VideoCompressorApp:
             "out_dir":         self.out_dir_var.get(),
         }
 
-        # 상태 초기화
+        # 상태 초기화 (예상 압축 켼럼은 유지)
         for f in self.files:
-            self.tree.item(f["iid"], values=(f["name"], fmt_size(f["size"]), "—", "—", "⏳ 대기"),
-                           tags=("wait",))
+            est_sz, ratio = estimate_compression(f.get("codec", ""), settings["crf"], f["size"])
+            est_txt = f"~{fmt_size(est_sz)}  (-{ratio*100:.0f}%)"
+            self.tree.item(f["iid"], values=(
+                f["display_name"], fmt_size(f["size"]), est_txt,
+                f.get("duration_str", "—"), f.get("resolution", "—"), "⏳ 대기"
+            ), tags=("wait",))
         self.pb_total["value"] = 0
         self.pb_file["value"]  = 0
 
@@ -939,8 +1063,8 @@ class VideoCompressorApp:
         self.btn_stop.config(state=tk.NORMAL)
         self.status_lbl.config(text="압축 중...", fg=CLR_ACCENT)
 
-        paths = [f["path"] for f in self.files]
-        self.worker = CompressWorker(self.ffmpeg, paths, settings, self.q)
+        paths = self.files  # dict 리스트 그대로 전달 (rel_path, base_folder 포함)
+        self.worker = CompressWorker(self.ffmpeg, self.files, settings, self.q)
         self.wthread = threading.Thread(target=self.worker.run, daemon=True)
         self.wthread.start()
         self._log("─" * 50, "dim")
@@ -959,22 +1083,22 @@ class VideoCompressorApp:
                 msg, data = self.q.get_nowait()
 
                 if msg == "file_start":
-                    idx, total, name = data
+                    idx, total, display_name = data
                     self.pb_file["value"] = 0
                     self.lbl_file_pct.config(text="0%")
                     self.lbl_total_cnt.config(text=f"{idx} / {total} 파일")
-                    self.lbl_cur_file.config(text=f"현재: {name[:60]}")
+                    self.lbl_cur_file.config(text=f"현재: {display_name[:60]}")
                     self.lbl_eta.config(text="ETA —")
                     self.lbl_elapsed.config(text="경과 —")
-                    self.status_lbl.config(text=f"처리 중: {name[:30]}")
-                    # 트리 상태 업데이트
+                    short = Path(display_name).name
+                    self.status_lbl.config(text=f"처리 중: {short[:30]}")
                     for f in self.files:
-                        if f["name"] == name:
-                            self.tree.item(f["iid"],
-                                           values=(f["name"], fmt_size(f["size"]),
-                                                   "—", "—", "🔄 압축 중"),
-                                           tags=("running",))
-                    self._log(f"▶ {name}", "info")
+                        if f["display_name"] == display_name:
+                            self.tree.item(f["iid"], values=(
+                                f["display_name"], fmt_size(f["size"]),
+                                "🔄 압축 중", "—", "—", "🔄 압축 중"
+                            ), tags=("running",))
+                    self._log(f"▶ {display_name}", "info")
 
                 elif msg == "file_progress":
                     pct, eta = data
@@ -999,17 +1123,19 @@ class VideoCompressorApp:
                     self.lbl_ratio.config(text=f"압축률 ↓{d['ratio']:.1f}%")
                     self.lbl_elapsed.config(text=f"경과 {fmt_dur(d['elapsed'])}")
                     self.lbl_eta.config(text="✔ 완료")
-                    # 트리 업데이트
                     for f in self.files:
-                        if f["name"] == d["name"]:
+                        if f["display_name"] == d["display_name"]:
                             f["status"] = "done"
-                            status_txt = f"✅ {fmt_size(d['out_sz'])} ({d['ratio']:.1f}%↓)"
-                            self.tree.item(f["iid"],
-                                           values=(f["name"], fmt_size(d["in_sz"]),
-                                                   f.get("duration_str", "—"), "—", status_txt),
-                                           tags=("done",))
+                            actual_txt = f"✅ {fmt_size(d['out_sz'])} (-{d['ratio']:.1f}%)"
+                            self.tree.item(f["iid"], values=(
+                                f["display_name"], fmt_size(d["in_sz"]),
+                                actual_txt,
+                                f.get("duration_str", "—"),
+                                f.get("resolution", "—"),
+                                "✅ 완료"
+                            ), tags=("done",))
                     self._log(
-                        f"  ✅ {d['name']}  "
+                        f"  ✅ {d['display_name']}  "
                         f"{fmt_size(d['in_sz'])} → {fmt_size(d['out_sz'])}  "
                         f"({d['ratio']:.1f}%↓  {fmt_dur(d['elapsed'])})", "ok")
 
@@ -1017,10 +1143,10 @@ class VideoCompressorApp:
                     name, err = data
                     for f in self.files:
                         if f["name"] == name:
-                            self.tree.item(f["iid"],
-                                           values=(f["name"], fmt_size(f["size"]),
-                                                   "—", "—", "❌ 오류"),
-                                           tags=("error",))
+                            self.tree.item(f["iid"], values=(
+                                f["display_name"], fmt_size(f["size"]),
+                                "❌ 오류", "—", "—", "❌ 오류"
+                            ), tags=("error",))
                     self._log(f"  ❌ {name}: {err}", "err")
 
                 elif msg == "all_done":
