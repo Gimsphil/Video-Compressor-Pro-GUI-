@@ -67,6 +67,7 @@ echo.
     --add-data "main.py;." ^
     --add-data "assets;assets" ^
     --add-data "README.md;." ^
+    --add-data "ffmpeg;ffmpeg" ^
     --hidden-import tkinter ^
     --hidden-import tkinter.ttk ^
     --hidden-import tkinter.filedialog ^
